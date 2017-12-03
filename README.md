@@ -1,0 +1,2 @@
+# atlas
+A GraphQL store
