@@ -51,7 +51,7 @@ export interface ReadContext { // TODO: Rename this to Options.
 export type WriteContext = ReadContext;
 
 // interface ProxyHandler {
-//     get: (obj: GraphNode, name: string) => any;
+//     get: (obj: ObjectGraphNode, name: string) => any;
 // }
 
 export type UnsubscribeFunction = () => void;
@@ -90,16 +90,16 @@ export interface ReadInfo {
     isOptimistic: boolean;
     query: DocumentNode;
     rootId: string;
-    rootNode: GraphNode | undefined;
+    rootNode: ObjectGraphNode | undefined;
     fragmentDefinitions: FragmentMap;
 }
 
-export type NodeIndex = { [key: string]: GraphNode };
+export type NodeIndex = { [key: string]: ObjectGraphNode };
 
 export const QUERY_ROOT_ID = 'QUERY';
 
 export interface GraphNodeData {
-    [key: string]: GraphNode | GraphNode[] | SerializableValue;
+    [key: string]: ObjectGraphNode | ObjectGraphNode[] | SerializableValue;
 }
 
 export class GraphNode {
@@ -108,17 +108,16 @@ export class GraphNode {
     public subscribers: Subscriber[] = [];
     public optimisticSubscribers: Subscriber[] = [];
     protected data: GraphNodeData;
-    private transactionId: number; // The transaction this node was written by.
-    private isOptimistic: boolean;
-    private newerVersion: GraphNode | undefined;
-    private newerOptimsticVersion: GraphNode | undefined;
+    protected transactionId: number; // The transaction this node was written by.
+    protected isOptimistic: boolean;
+    protected newerVersion: GraphNode | undefined;
+    protected newerOptimsticVersion: GraphNode | undefined;
 
-    public constructor(tx: TransactionInfo, data?: { [key: string]: GraphNode | GraphNode[] | SerializableValue }) {
+    public constructor(tx: TransactionInfo, data?: { [key: string]: ObjectGraphNode | ObjectGraphNode[] | SerializableValue }) {
         this.transactionId = tx.id;
         this.data = data || Object.create(null);
         this.isOptimistic = tx.isOptimistic;
     }
-
 
     public subscribe(s: Subscriber, optimistic = false) {
         if (optimistic) {
@@ -132,32 +131,8 @@ export class GraphNode {
         this.subscribers = this.subscribers.filter(sub => sub !== s);
     }
 
-    // Copy parents over from old node, creating a new reference of the parent where necessary
-    // Also updates the index entry
-    public adoptParents(previousNode: GraphNode, tx: TransactionInfo) {
-        this.parents = previousNode.parents.map(parent => {
-            return {
-                node: parent.node.set(parent.key, this, tx),
-                key: parent.key,
-            };
-        });
-        this.indexEntry = previousNode.indexEntry;
-        if (this.indexEntry) {
-            if (tx.isOptimistic) {
-                // throw new Error('Optimistic index update not implemented');
-                // TODO: refactor the whole index handling. GraphNodes should know their
-                // own ID, and they can perfectly well update the index. We just need
-                // to give them a reference to it. Optimistic nodes update the optimistc
-                // index, normal nodes update the normal index. It's as simple as that.
-                this.indexEntry.optimisticIndex[this.indexEntry.key] = this;
-            } else {
-                this.indexEntry.index[this.indexEntry.key] = this;
-            }
-        }
-    }
-
     // TODO: could I just use immutable here?
-    public set(key: string | number, value: GraphNode | SerializableValue, tx: TransactionInfo): GraphNode {
+    public set(key: string | number, value: ObjectGraphNode | SerializableValue, tx: TransactionInfo): GraphNode {
         if (this.newerVersion) {
             // Always set on the newest version
             return this.newerVersion.set(key, value, tx);
@@ -175,7 +150,7 @@ export class GraphNode {
             this.data[key] = value;
             return this;
         }
-        const newNode = new GraphNode(tx, { ...this.data, [key]: value });
+        const newNode = new ObjectGraphNode(tx, { ...this.data, [key]: value });
         newNode.adoptParents(this, tx);
         this.notifySubscribers(tx);
         if (tx.isOptimistic) {
@@ -186,15 +161,37 @@ export class GraphNode {
         return newNode;
     }
 
-    public get(key: string | number): GraphNode | SerializableValue | undefined {
+    public get(key: string | number): ObjectGraphNode | ArrayGraphNode | SerializableValue | undefined {
         return this.data[key];
-    }
-    public getProxy(selectionSet: SelectionSetNode, info: ReadInfo) {
-        return new Proxy(this.data, new ObjectHandler(selectionSet, info));
     }
 
     public addParent(node: GraphNode, key: string | number) {
         this.parents.push({ node, key });
+    }
+
+    // Copy parents over from old node, creating a new reference of the parent where necessary
+    // Also updates the index entry
+    public adoptParents(previousNode: GraphNode, tx: TransactionInfo) {
+        this.parents = previousNode.parents.map(parent => {
+            return {
+                node: parent.node.set(parent.key, this, tx),
+                key: parent.key,
+            };
+        });
+        this.indexEntry = previousNode.indexEntry;
+        // Type guard is just for TS. ArrayGraphNodes don't have index entries
+        if (this.indexEntry && this instanceof ObjectGraphNode) {
+            if (tx.isOptimistic) {
+                // throw new Error('Optimistic index update not implemented');
+                // TODO: refactor the whole index handling. GraphNodes should know their
+                // own ID, and they can perfectly well update the index. We just need
+                // to give them a reference to it. Optimistic nodes update the optimistc
+                // index, normal nodes update the normal index. It's as simple as that.
+                this.indexEntry.optimisticIndex[this.indexEntry.key] = this;
+            } else {
+                this.indexEntry.index[this.indexEntry.key] = this;
+            }
+        }
     }
 
     public setIndexEntry(index: NodeIndex, optimisticIndex: NodeIndex, key: string) {
@@ -208,6 +205,12 @@ export class GraphNode {
         if (!tx.isOptimistic) {
             tx.subscribersToNotify = tx.subscribersToNotify.concat(this.subscribers);
         }
+    }
+}
+
+export class ObjectGraphNode extends GraphNode {
+    public getProxy(selectionSet: SelectionSetNode, info: ReadInfo) {
+        return new Proxy(this.data, new ObjectHandler(selectionSet, info));
     }
 }
 
@@ -316,7 +319,7 @@ export default class Store {
         //     subscriber. This is especially true of the root node. But let's solve this problem some other
         //     day.
         const rootId = context && context.rootId || QUERY_ROOT_ID;
-        const rootNode: GraphNode | undefined = this.nodeIndex[rootId];
+        const rootNode: ObjectGraphNode | undefined = this.nodeIndex[rootId];
 
         const writeInfo: WriteInfo = {
             variables: context && context.variables || {},
@@ -441,13 +444,13 @@ export default class Store {
     }
 
     private writeSelectionSet(
-        node: GraphNode | undefined,
+        node: ObjectGraphNode | undefined,
         selectionSet: SelectionSetNode,
         data: SerializableObject,
         info: WriteInfo,
-    ): GraphNode {
+    ): ObjectGraphNode {
         // TODO: Update / set index if node with key has been written.
-        let newNode = node || this.getExistingGraphNode(data) || new GraphNode(info.txInfo);
+        let newNode = node || this.getExistingGraphNode(data) || new ObjectGraphNode(info.txInfo);
         selectionSet.selections.forEach(selection => {
             if (selection.kind === 'Field') {
                 const dataName: string = (selection.alias && selection.alias.value) || selection.name.value;
@@ -482,13 +485,13 @@ export default class Store {
         return newNode;
     }
 
-    private getExistingGraphNode(data: SerializableObject): GraphNode | undefined {
+    private getExistingGraphNode(data: SerializableObject): ObjectGraphNode | undefined {
         const key = getStoreKeyFromObject(data);
         return key ? this.nodeIndex[key] : undefined;
     }
 
     private writeArrayNode(
-        node: GraphNode | ArrayGraphNode,
+        node: ObjectGraphNode | ArrayGraphNode,
         storeName: string | number,
         field: FieldNode,
         data: SerializableObject[],
@@ -505,16 +508,16 @@ export default class Store {
         data.forEach((arrayElement, i) => {
             if (Array.isArray(arrayElement)) {
                 // recurse for nested arrays
-                arrayNode = this.writeArrayNode(arrayNode, i, field, arrayElement, info);
+                arrayNode = this.writeArrayNode(arrayNode, i, field, arrayElement, info) as ArrayGraphNode;
             } else {
                 const currentElement = arrayNode.get(i);
                 const childNode = this.writeSelectionSet(
-                    currentElement instanceof GraphNode ? currentElement : undefined,
+                    currentElement instanceof ObjectGraphNode ? currentElement : undefined,
                     field.selectionSet as SelectionSetNode,
                     arrayElement,
                     info,
                 );
-                arrayNode = arrayNode.set(i, childNode, info.txInfo);
+                arrayNode = arrayNode.set(i, childNode, info.txInfo) as ArrayGraphNode;
                 childNode.addParent(arrayNode, i);
             }
         });
@@ -530,15 +533,15 @@ export default class Store {
 
     // TODO: Pass only what the field needs to know to the field. Hold back all other info.
     private writeField(
-        node: GraphNode,
+        node: ObjectGraphNode,
         field: FieldNode,
         data: SerializableValue,
         info: WriteInfo,
-    ): GraphNode {
+    ): ObjectGraphNode {
         const storeName: string = getStoreName(field, info.variables);
         if (field.selectionSet === null || typeof field.selectionSet === 'undefined' || data === null) {
             // Scalar (maybe array) field or null value
-            return node.set(storeName, data, info.txInfo);
+            return node.set(storeName, data, info.txInfo) as ObjectGraphNode;
         } else {
             if (Array.isArray(data)) {
                 return this.writeArrayNode(
@@ -547,14 +550,14 @@ export default class Store {
                     field,
                     data,
                     info,
-                );
+                ) as ObjectGraphNode;
                 // If it's a nested array
                 // Recurse in this function, create the child nodes when it's not an array
                 // any more. Set parent on all the great* grandchildren.
             } else {
                 const currentChild = node.get(storeName);
                 const childNode = this.writeSelectionSet(
-                    currentChild instanceof GraphNode ? currentChild : undefined,
+                    currentChild instanceof ObjectGraphNode ? currentChild : undefined,
                     field.selectionSet,
                     data as SerializableObject,
                     info,
@@ -563,7 +566,7 @@ export default class Store {
                     storeName,
                     childNode,
                     info.txInfo,
-                );
+                ) as ObjectGraphNode;
                 childNode.addParent(parentNode, storeName);
                 return parentNode;
             }
@@ -572,7 +575,7 @@ export default class Store {
 
     // private getHandler(query: SelectionSetNode, context: ReadContext): ProxyHandler {
     //     // TODO: make this more efficient later
-    //     return { get(obj: GraphNode, name: string) { return obj[name] } };
+    //     return { get(obj: ObjectGraphNode, name: string) { return obj[name] } };
     // }
 }
 
@@ -683,12 +686,12 @@ export class ArrayHandler {
     public constructor(private selectionSet: SelectionSetNode, private info: ReadInfo) {
     }
 
-    public get(target: Array<GraphNode>, name: number) {
+    public get(target: Array<ObjectGraphNode>, name: number) {
         // For length, non-existent properties etc. we just do a passthrough
         if (typeof target[name] !== 'object') {
             return target[name];
         }
-        // TODO: Through the iterator it seems to be possible to directly access the underlying graphNode
+        // TODO: Through the iterator it seems to be possible to directly access the underlying ObjectGraphNode
         return target[name].getProxy(this.selectionSet, this.info);
     }
     public set() { return false; }
@@ -715,7 +718,7 @@ export class ObjectHandler {
                     // return new Proxy(target[storeName], this.getArrayHandler(node.selectionSet.selections, variables));
                     return (value as ArrayGraphNode).getProxy(node.selectionSet, this.info);
                 }
-                return (value as GraphNode).getProxy(node.selectionSet, this.info);
+                return (value as ObjectGraphNode).getProxy(node.selectionSet, this.info);
             }
             // It's a scalar
             return value;
